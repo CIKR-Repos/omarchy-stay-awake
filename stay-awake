@@ -1,0 +1,338 @@
+#!/bin/bash
+
+# Keep the system awake: no screensaver, lock or suspend (lid closed included),
+# and move the cursor now and then so apps keep seeing activity.
+#
+#   stay-awake on|off|toggle|status
+#   stay-awake get                 settings + state as JSON (used by the bar panel)
+#   stay-awake set <key> <value>   change a setting; applies at once when on
+#   stay-awake test                move the mouse once with the current settings
+#   stay-awake lid-close           Hyprland lid binding; skips the lock while on
+#
+# Settings live in ~/.config/omarchy/stay-awake.json.
+
+UNIT="omarchy-stay-awake"
+CONFIG="$HOME/.config/omarchy/stay-awake.json"
+STATE_DIR="$HOME/.local/state/omarchy/stay-awake"
+# Holding: we turned Omarchy's stay-awake on. Keep: it was already on, leave it.
+HOLD_IDLE_FLAG="$STATE_DIR/holding-idle"
+KEEP_IDLE_FLAG="$STATE_DIR/idle-was-awake"
+UNTIL_FILE="$STATE_DIR/until"
+SELF="$(readlink -f "$0")"
+
+DEFAULTS='{
+  "screen": true,
+  "sleep": true,
+  "lid": true,
+  "lidLock": false,
+  "mouse": true,
+  "interval": 60,
+  "distance": 1,
+  "speed": "instant",
+  "pattern": "nudge",
+  "autoOff": 0,
+  "minBattery": 0,
+  "notify": true
+}'
+
+config() {
+  if [[ -f $CONFIG ]] && jq -e 'type == "object"' "$CONFIG" >/dev/null 2>&1; then
+    jq -c --argjson d "$DEFAULTS" '$d + .' "$CONFIG"
+  else
+    jq -c . <<<"$DEFAULTS"
+  fi
+}
+
+# Read one setting from the merged config.
+cfg() {
+  jq -r --arg k "$1" '.[$k]' <<<"$CONF"
+}
+
+load_config() {
+  CONF=$(config)
+}
+
+active() {
+  systemctl --user is-active --quiet "$UNIT"
+}
+
+notify() {
+  [[ $(cfg notify) == true ]] && notify-send -t 2500 "Stay Awake" "$1" 2>/dev/null
+}
+
+hold_idle() {
+  [[ -f $HOLD_IDLE_FLAG ]] && return
+  if [[ $(omarchy-toggle-idle status 2>/dev/null) == *'"enabled":true'* ]]; then
+    touch "$KEEP_IDLE_FLAG"
+  else
+    rm -f "$KEEP_IDLE_FLAG"
+  fi
+  omarchy-toggle-idle stay-awake >/dev/null
+  touch "$HOLD_IDLE_FLAG"
+}
+
+release_idle() {
+  [[ -f $HOLD_IDLE_FLAG ]] || return
+  [[ -f $KEEP_IDLE_FLAG ]] || omarchy-toggle-idle allow-idle >/dev/null
+  rm -f "$HOLD_IDLE_FLAG" "$KEEP_IDLE_FLAG"
+}
+
+# Start the background unit from the current settings. The unit holds the
+# logind inhibitor and runs the mouse/auto-off loop.
+start_unit() {
+  local what=()
+  [[ $(cfg screen) == true ]] && what+=(idle)
+  [[ $(cfg sleep) == true ]] && what+=(sleep)
+  # handle-lid-switch is a low-level lock logind honours even with
+  # LidSwitchIgnoreInhibited=yes, so a closed lid no longer suspends.
+  [[ $(cfg lid) == true ]] && what+=(handle-lid-switch)
+
+  if [[ $(cfg screen) == true ]]; then hold_idle; else release_idle; fi
+
+  local cmd=("$SELF" __loop)
+  if ((${#what[@]})); then
+    local joined
+    joined=$(IFS=:; echo "${what[*]}")
+    cmd=(systemd-inhibit --what="$joined" --mode=block
+      --who="Stay Awake" --why="Stay Awake plugin is on" "${cmd[@]}")
+  fi
+
+  systemd-run --user --quiet --collect --unit="$UNIT" \
+    --description="Stay Awake (Omarchy plugin)" \
+    --setenv=HYPRLAND_INSTANCE_SIGNATURE="$HYPRLAND_INSTANCE_SIGNATURE" \
+    --setenv=XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+    --setenv=WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+    --setenv=DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+    "${cmd[@]}"
+}
+
+set_deadline() {
+  local minutes
+  minutes=$(cfg autoOff)
+  if ((minutes > 0)); then
+    echo $(($(date +%s) + minutes * 60)) >"$UNTIL_FILE"
+  else
+    rm -f "$UNTIL_FILE"
+  fi
+}
+
+turn_on() {
+  active && return
+  mkdir -p "$STATE_DIR"
+  load_config
+  set_deadline
+  start_unit
+  local msg="On"
+  [[ $(cfg lid) == true ]] && msg+=", lid close ignored"
+  [[ $(cfg mouse) == true ]] && msg+=", mouse every $(cfg interval)s"
+  [[ -f $UNTIL_FILE ]] && msg+=", until $(date -d "@$(<"$UNTIL_FILE")" +%H:%M)"
+  notify "$msg"
+}
+
+turn_off() {
+  load_config
+  release_idle
+  rm -f "$UNTIL_FILE"
+  systemctl --user stop "$UNIT" 2>/dev/null
+  notify "${1:-Off: normal idle, lock and sleep}"
+}
+
+# Restart with new settings, keeping the auto-off deadline unless it changed.
+reapply() {
+  local key="$1"
+  active || return
+  load_config
+  [[ $key == autoOff ]] && set_deadline
+  systemctl --user stop "$UNIT" 2>/dev/null
+  start_unit
+}
+
+move_to() {
+  hyprctl eval "hl.dispatch(hl.dsp.cursor.move({x=$1,y=$2}))" >/dev/null 2>&1
+}
+
+# Glide from (x0,y0) to (x1,y1) in the configured number of steps.
+glide() {
+  local x0=$1 y0=$2 x1=$3 y1=$4 steps=$5 delay=$6 i
+  for ((i = 1; i <= steps; i++)); do
+    move_to $((x0 + (x1 - x0) * i / steps)) $((y0 + (y1 - y0) * i / steps))
+    ((i < steps)) && sleep "$delay"
+  done
+}
+
+move_mouse() {
+  local pos x y d dx dy steps delay
+  pos=$(hyprctl cursorpos 2>/dev/null) || return
+  [[ $pos =~ ^(-?[0-9]+),\ (-?[0-9]+)$ ]] || return
+  x=${BASH_REMATCH[1]}
+  y=${BASH_REMATCH[2]}
+  d=$(cfg distance)
+
+  case $(cfg pattern) in
+    random)
+      dx=$((RANDOM % (2 * d + 1) - d))
+      dy=$((RANDOM % (2 * d + 1) - d))
+      ((dx == 0 && dy == 0)) && dx=$d
+      ;;
+    circle)
+      # Square path around the current spot, ending where it started.
+      case $(cfg speed) in
+        slow) steps=10 delay=0.04 ;;
+        smooth) steps=5 delay=0.015 ;;
+        *) steps=1 delay=0 ;;
+      esac
+      glide "$x" "$y" $((x + d)) "$y" "$steps" "$delay"
+      glide $((x + d)) "$y" $((x + d)) $((y + d)) "$steps" "$delay"
+      glide $((x + d)) $((y + d)) "$x" $((y + d)) "$steps" "$delay"
+      glide "$x" $((y + d)) "$x" "$y" "$steps" "$delay"
+      return
+      ;;
+    *)
+      dx=$d
+      dy=0
+      ;;
+  esac
+
+  case $(cfg speed) in
+    slow) steps=20 delay=0.04 ;;
+    smooth) steps=8 delay=0.015 ;;
+    *) steps=1 delay=0 ;;
+  esac
+
+  glide "$x" "$y" $((x + dx)) $((y + dy)) "$steps" "$delay"
+  sleep 0.2
+  glide $((x + dx)) $((y + dy)) "$x" "$y" "$steps" "$delay"
+}
+
+battery_low() {
+  local min bat status capacity
+  min=$(cfg minBattery)
+  ((min > 0)) || return 1
+  for bat in /sys/class/power_supply/BAT*; do
+    [[ -r $bat/capacity ]] || continue
+    status=$(<"$bat/status")
+    capacity=$(<"$bat/capacity")
+    [[ $status == Discharging ]] && ((capacity < min)) && return 0
+  done
+  return 1
+}
+
+# Off from inside the unit: a separate unit does it, since stopping our own
+# unit would kill this loop halfway through turning off.
+stop_self() {
+  systemd-run --user --quiet --collect "$SELF" off "$1"
+  exit 0
+}
+
+# Runs inside the unit. Wakes at least every 30s so auto-off, battery and
+# setting changes are picked up without a restart.
+loop() {
+  local last_move now wait remaining until
+  last_move=$(date +%s)
+  while true; do
+    load_config
+    now=$(date +%s)
+    wait=30
+    if [[ $(cfg mouse) == true ]]; then
+      remaining=$((last_move + $(cfg interval) - now))
+      ((remaining < wait)) && wait=$remaining
+    fi
+    if [[ -f $UNTIL_FILE ]]; then
+      until=$(<"$UNTIL_FILE")
+      ((until - now < wait)) && wait=$((until - now))
+    fi
+    ((wait > 0)) && sleep "$wait"
+
+    load_config
+    now=$(date +%s)
+    [[ -f $UNTIL_FILE ]] && (($(<"$UNTIL_FILE") <= now)) && stop_self "Off: auto-off timer finished"
+    battery_low && stop_self "Off: battery below $(cfg minBattery)%"
+    if [[ $(cfg mouse) == true ]] && ((now - last_move >= $(cfg interval))); then
+      move_mouse
+      last_move=$(date +%s)
+    fi
+  done
+}
+
+# Validate and store one setting.
+set_setting() {
+  local key="$1" value="$2" json
+  case $key in
+    screen | sleep | lid | lidLock | mouse | notify)
+      [[ $value == true || $value == false ]] || { echo "$key must be true or false" >&2; exit 1; }
+      json=$value
+      ;;
+    interval)
+      [[ $value =~ ^[0-9]+$ ]] && ((value >= 5 && value <= 3600)) || { echo "interval must be 5-3600 seconds" >&2; exit 1; }
+      json=$value
+      ;;
+    distance)
+      [[ $value =~ ^[0-9]+$ ]] && ((value >= 1 && value <= 200)) || { echo "distance must be 1-200 px" >&2; exit 1; }
+      json=$value
+      ;;
+    autoOff)
+      [[ $value =~ ^[0-9]+$ ]] && ((value <= 1440)) || { echo "autoOff must be 0-1440 minutes" >&2; exit 1; }
+      json=$value
+      ;;
+    minBattery)
+      [[ $value =~ ^[0-9]+$ ]] && ((value <= 100)) || { echo "minBattery must be 0-100" >&2; exit 1; }
+      json=$value
+      ;;
+    speed)
+      [[ $value =~ ^(instant|smooth|slow)$ ]] || { echo "speed must be instant, smooth or slow" >&2; exit 1; }
+      json="\"$value\""
+      ;;
+    pattern)
+      [[ $value =~ ^(nudge|random|circle)$ ]] || { echo "pattern must be nudge, random or circle" >&2; exit 1; }
+      json="\"$value\""
+      ;;
+    *)
+      echo "Unknown setting: $key" >&2
+      exit 1
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$CONFIG")"
+  local tmp
+  tmp=$(mktemp "$CONFIG.XXXXXX")
+  config | jq --arg k "$key" --argjson v "$json" '.[$k] = $v' >"$tmp" && mv "$tmp" "$CONFIG"
+
+  # The loop re-reads mouse settings by itself; the rest need a restart.
+  case $key in
+    screen | sleep | lid | autoOff) reapply "$key" ;;
+  esac
+}
+
+print_state() {
+  local on=false until=0
+  active && on=true
+  [[ -f $UNTIL_FILE ]] && until=$(<"$UNTIL_FILE")
+  config | jq -c --argjson on "$on" --argjson until "$until" '{active: $on, until: $until, settings: .}'
+}
+
+case "${1:-toggle}" in
+  on) turn_on ;;
+  off) turn_off "$2" ;;
+  toggle) if active; then turn_off; else turn_on; fi ;;
+  status) if active; then echo on; else echo off; fi ;;
+  get) print_state ;;
+  set)
+    [[ $# -eq 3 ]] || { echo "Usage: stay-awake set <key> <value>" >&2; exit 1; }
+    set_setting "$2" "$3"
+    ;;
+  test) load_config; move_mouse ;;
+  lid-close)
+    # Omarchy locks on lid close; skip that while on unless lidLock is set.
+    load_config
+    if active && [[ $(cfg lidLock) != true ]]; then
+      omarchy-hyprland-monitor-clamshell
+    else
+      omarchy-system-lid-close
+    fi
+    ;;
+  __loop) loop ;;
+  *)
+    echo "Usage: stay-awake [on|off|toggle|status|get|set <key> <value>|test|lid-close]" >&2
+    exit 1
+    ;;
+esac

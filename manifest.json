@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "cikr-repos.stay-awake",
+  "name": "Stay Awake",
+  "version": "0.1.0",
+  "author": "CIKR",
+  "license": "MIT",
+  "description": "One click keeps the laptop awake: no screensaver, lock or suspend, even with the lid closed, and the cursor nudged every minute.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Stay Awake",
+    "description": "Keep the system awake with the lid closed and jiggle the mouse every minute",
+    "category": "System",
+    "aliases": ["caffeine", "caffeinate", "keep awake", "mouse jiggler", "lid", "no sleep"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
